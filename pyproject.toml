@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deltatrace"
+version = "0.1.0"
+description = "Git-style version control for tabular data: delta commits, recursive reconstruction and snapshots over Parquet."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Viswas Reddy Pallamreddy" }]
+keywords = ["data-versioning", "parquet", "pandas", "delta", "lakehouse", "time-travel"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = ["pandas>=1.5", "pyarrow>=10.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+deltatrace = "deltatrace.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Viswas-Reddy-PallamReddy/DeltaTrace"
+
+[tool.setuptools]
+packages = ["deltatrace"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

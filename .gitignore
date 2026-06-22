@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.venv/
+venv/
+
+# DeltaTrace stores created by examples / local runs
+/store/
+*.deltastore/
+demo_store/
+
+# OS
+.DS_Store
