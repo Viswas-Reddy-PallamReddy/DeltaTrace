@@ -14,5 +14,9 @@ venv/
 *.deltastore/
 demo_store/
 
+# Benchmark dataset cache (downloaded on demand)
+benchmarks/_cache/
+.ipynb_checkpoints/
+
 # OS
 .DS_Store

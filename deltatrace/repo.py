@@ -26,15 +26,30 @@ import pandas as pd
 
 from .diffing import (
     cell_level_changes,
+    changed_columns,
     changed_row_ids,
     column_diff,
     row_diff,
     type_changes,
 )
-from .identity import RID, normalize_keys, with_row_ids
+from .identity import (
+    RID,
+    ContentMatchIdentity,
+    IdentityStrategy,
+    PrimaryKeyIdentity,
+    make_identity,
+)
 from .storage import FORMAT_VERSION, Store, StoreError
 
-__all__ = ["DeltaRepo", "CommitResult", "DiffResult", "StoreError"]
+__all__ = [
+    "DeltaRepo",
+    "CommitResult",
+    "DiffResult",
+    "StoreError",
+    "ContentMatchIdentity",
+    "PrimaryKeyIdentity",
+    "IdentityStrategy",
+]
 
 
 @dataclass
@@ -78,10 +93,11 @@ class DiffResult:
 class DeltaRepo:
     """A versioned store for a single logical table, keyed by a primary key."""
 
-    def __init__(self, store: Store, primary_key: List[str], head: int,
+    def __init__(self, store: Store, identity: IdentityStrategy, head: int,
                  snapshot_interval: Optional[int]):
         self.store = store
-        self._keys = primary_key
+        self._identity = identity
+        self._keys = identity.user_keys or []
         self._head = head
         self._snapshot_interval = snapshot_interval
 
@@ -90,12 +106,25 @@ class DeltaRepo:
     def init(
         cls,
         root: Union[str, Path],
-        primary_key: Union[str, Sequence[str]],
+        primary_key: Optional[Union[str, Sequence[str]]] = None,
         *,
+        identity: Optional[IdentityStrategy] = None,
         snapshot_interval: Optional[int] = None,
         overwrite: bool = False,
     ) -> "DeltaRepo":
-        keys = normalize_keys(primary_key)
+        """Create a new repository.
+
+        Provide either a ``primary_key`` (the exact, keyed case) or a custom
+        ``identity`` strategy such as :class:`ContentMatchIdentity` for keyless
+        tables. Exactly one of the two must be given.
+        """
+        if identity is None:
+            if primary_key is None:
+                raise ValueError("provide either primary_key= or identity=")
+            identity = PrimaryKeyIdentity(primary_key)
+        elif primary_key is not None:
+            raise ValueError("pass primary_key= or identity=, not both")
+
         store = Store(root)
         if store.exists():
             if not overwrite:
@@ -108,25 +137,34 @@ class DeltaRepo:
         store.write_config(
             {
                 "format_version": FORMAT_VERSION,
-                "primary_key": keys,
+                "identity": identity.to_config(),
+                "primary_key": identity.user_keys,
                 "head": 0,
                 "snapshot_interval": snapshot_interval,
             }
         )
-        return cls(store, keys, head=0, snapshot_interval=snapshot_interval)
+        return cls(store, identity, head=0, snapshot_interval=snapshot_interval)
 
     @classmethod
     def open(cls, root: Union[str, Path]) -> "DeltaRepo":
         store = Store(root)
         cfg = store.read_config()
+        if cfg.get("identity"):
+            identity: IdentityStrategy = make_identity(cfg["identity"])
+        else:  # legacy repos predate the identity config
+            identity = PrimaryKeyIdentity(list(cfg["primary_key"]))
         return cls(
             store,
-            list(cfg["primary_key"]),
+            identity,
             head=int(cfg.get("head", 0)),
             snapshot_interval=cfg.get("snapshot_interval"),
         )
 
     # -- introspection --------------------------------------------------
+    @property
+    def identity(self) -> IdentityStrategy:
+        return self._identity
+
     @property
     def primary_key(self) -> List[str]:
         return list(self._keys)
@@ -134,6 +172,14 @@ class DeltaRepo:
     @property
     def keys(self) -> List[str]:
         return list(self._keys)
+
+    @property
+    def keyless(self) -> bool:
+        return not self._keys
+
+    def explain_last(self) -> Optional[pd.DataFrame]:
+        """Provenance of the most recent commit's row-identity assignment."""
+        return self._identity.explain()
 
     @property
     def head(self) -> int:
@@ -147,27 +193,33 @@ class DeltaRepo:
         return self._head
 
     def __repr__(self) -> str:
+        ident = type(self._identity).__name__
         return (
             f"DeltaRepo(root={str(self.store.root)!r}, "
-            f"primary_key={self._keys}, head={self._head})"
+            f"identity={ident}, primary_key={self._keys}, head={self._head})"
         )
 
     # -- commit ---------------------------------------------------------
     def commit(self, df: pd.DataFrame, message: str = "", *, audit: bool = False) -> CommitResult:
         """Record ``df`` as the next version, storing only its delta from head."""
-        vdf = with_row_ids(df, self._keys)
-        user_cols = [c for c in vdf.columns if c != RID]
-        schema = {
-            "columns": user_cols,
-            "dtypes": {c: str(vdf[c].dtype) for c in user_cols},
-        }
-
         if self._head == 0:
+            vdf = self._identity.assign(df, None)
+            user_cols = [c for c in vdf.columns if c != RID]
+            schema = {
+                "columns": user_cols,
+                "dtypes": {c: str(vdf[c].dtype) for c in user_cols},
+            }
             return self._commit_base(vdf, user_cols, schema, message)
 
         parent = self._head
         new_version = parent + 1
         head_frame = self._materialize(parent)
+        vdf = self._identity.assign(df, head_frame)
+        user_cols = [c for c in vdf.columns if c != RID]
+        schema = {
+            "columns": user_cols,
+            "dtypes": {c: str(vdf[c].dtype) for c in user_cols},
+        }
         parent_cols = [c for c in head_frame.columns if c != RID]
 
         cdiff = column_diff(parent_cols, user_cols)
@@ -178,11 +230,18 @@ class DeltaRepo:
         rdiff = row_diff(head_frame[RID].tolist(), vdf[RID].tolist())
         changed = changed_row_ids(head_frame, vdf, rdiff.unchanged, common_cols)
 
-        upsert_ids = set(rdiff.appended) | set(changed)
         carried = [c for c in user_cols if c in set(common_cols)]
-        upserts = (
-            vdf[vdf[RID].isin(upsert_ids)][[RID] + carried].copy()
-            if upsert_ids else None
+        # Inserts carry the whole row; updates carry only the columns that moved.
+        # Recovering row identity is exactly what lets an update be a few cells
+        # instead of a full-row delete + insert.
+        inserts = (
+            vdf[vdf[RID].isin(rdiff.appended)][[RID] + carried].copy()
+            if rdiff.appended else None
+        )
+        chg_cols = changed_columns(head_frame, vdf, changed, common_cols)
+        updates = (
+            vdf[vdf[RID].isin(set(changed))][[RID] + chg_cols].copy()
+            if changed and chg_cols else None
         )
 
         added_columns = None
@@ -197,8 +256,10 @@ class DeltaRepo:
         vdir = self.store.version_dir(new_version)
         vdir.mkdir(parents=True, exist_ok=True)
         components: Dict[str, str] = {}
-        if self.store.write_parquet(upserts, vdir / "upserts.parquet"):
+        if self.store.write_parquet(inserts, vdir / "upserts.parquet"):
             components["upserts"] = "upserts.parquet"
+        if self.store.write_parquet(updates, vdir / "updates.parquet"):
+            components["updates"] = "updates.parquet"
         if self.store.write_json(sorted(rdiff.deleted), vdir / "deleted_ids.json"):
             components["deleted_ids"] = "deleted_ids.json"
         if self.store.write_parquet(added_columns, vdir / "added_columns.parquet"):
@@ -245,12 +306,24 @@ class DeltaRepo:
 
     # -- reconstruction -------------------------------------------------
     def checkout(self, version: Optional[int] = None) -> pd.DataFrame:
-        """Return the materialised DataFrame for ``version`` (default: head)."""
+        """Return the materialised DataFrame for ``version`` (default: head).
+
+        With a declared key the result is sorted by that key. Keyless tables have
+        no meaningful row order, so the rows are returned in a deterministic
+        canonical order (sorted by all columns) -- reconstruction fidelity is
+        defined as multiset equality, not positional equality.
+        """
         version = self._resolve_version(version)
         df = self._materialize(version)
         if RID in df.columns:
             df = df.drop(columns=[RID])
-        return df.sort_values(by=self._keys, kind="stable").reset_index(drop=True)
+        if self._keys:
+            return df.sort_values(by=self._keys, kind="stable").reset_index(drop=True)
+        if len(df.columns):
+            return df.sort_values(
+                by=list(df.columns), kind="stable", na_position="last"
+            ).reset_index(drop=True)
+        return df.reset_index(drop=True)
 
     # Backwards-friendly alias mirroring the prototype's vocabulary.
     reconstruct = checkout
@@ -287,6 +360,16 @@ class DeltaRepo:
             up = self.store.read_parquet(up_path)
             df = df[~df[RID].isin(set(up[RID]))]
             df = pd.concat([df, up], ignore_index=True)
+
+        upd_path = vdir / "updates.parquet"
+        if upd_path.exists():
+            upd = self.store.read_parquet(upd_path).set_index(RID)
+            df = df.set_index(RID)
+            for col in upd.columns:
+                # Overwrite only the changed cells of already-present rows. NaNs in
+                # ``upd`` are honoured (a cell genuinely updated to null).
+                df.loc[upd.index, col] = upd[col].values
+            df = df.reset_index()
 
         ac_path = vdir / "added_columns.parquet"
         if ac_path.exists():

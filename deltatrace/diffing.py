@@ -82,6 +82,38 @@ def changed_row_ids(
     return [str(i) for i in idx[differs.values]]
 
 
+def changed_columns(
+    old_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    changed_ids: Sequence[str],
+    compare_cols: Sequence[str],
+) -> List[str]:
+    """Return the subset of ``compare_cols`` that differ in *some* changed row.
+
+    This drives cell-level update deltas: instead of re-storing a whole row when
+    one cell changes, the engine stores only the columns that actually moved.
+    Knowing a row's identity is precisely what makes this possible -- a keyless,
+    hash-only system cannot tell an update from a delete + insert and must
+    re-store the entire row.
+    """
+    cols = [c for c in compare_cols if c != RID]
+    changed = list(changed_ids)
+    if not changed or not cols:
+        return []
+
+    old = old_df[old_df[RID].isin(changed)].set_index(RID)
+    new = new_df[new_df[RID].isin(changed)].set_index(RID)
+    new = new.reindex(old.index)
+
+    out: List[str] = []
+    for col in cols:
+        a, b = old[col], new[col]
+        ne = (a.values != b.values) & ~(pd.isna(a.values) & pd.isna(b.values))
+        if bool(ne.any()):
+            out.append(col)
+    return out
+
+
 def cell_level_changes(
     old_df: pd.DataFrame,
     new_df: pd.DataFrame,

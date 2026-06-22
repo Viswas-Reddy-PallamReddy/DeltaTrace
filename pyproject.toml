@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deltatrace"
-version = "0.1.0"
+version = "0.2.0"
 description = "Git-style version control for tabular data: delta commits, recursive reconstruction and snapshots over Parquet."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +21,7 @@ dependencies = ["pandas>=1.5", "pyarrow>=10.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+bench = ["matplotlib>=3.5", "numpy>=1.23", "jupyterlab", "ipykernel", "nbclient>=0.7", "nbformat>=5"]
 
 [project.scripts]
 deltatrace = "deltatrace.cli:main"

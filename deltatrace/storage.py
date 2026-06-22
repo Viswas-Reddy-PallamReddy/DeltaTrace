@@ -25,7 +25,7 @@ from typing import Dict, Iterable, List, Optional
 import pandas as pd
 
 CONFIG_NAME = "deltatrace.json"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 class StoreError(RuntimeError):
