@@ -22,19 +22,39 @@ merely updated). The residual pass is what recovers those updates. Crucially, th
 wrong guess only costs storage, never fidelity (see :mod:`deltatrace.identity` and
 the error-confinement tests).
 
-Everything here is pure and dependency-light (stdlib :mod:`difflib` for fuzzy
-string comparison); the only third-party import is pandas.
+Fuzzy string comparison uses :mod:`rapidfuzz` when it is installed (a small, fast
+C-extension) and transparently falls back to the stdlib :mod:`difflib` otherwise,
+so the core stays dependency-light. The only required third-party import is pandas.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+# Fuzzy string similarity backend. rapidfuzz (a small C-extension) is ~10-100x
+# faster than the stdlib and is used automatically when installed; otherwise we
+# fall back to difflib so the core stays dependency-light. Both return a ratio in
+# [0, 1] with the same Indel/LCS semantics, so matching results are equivalent.
+try:
+    from rapidfuzz import process as _rf_process
+    from rapidfuzz.distance import Indel as _Indel
+
+    def _string_ratio(a: str, b: str) -> float:
+        return _Indel.normalized_similarity(a, b)
+
+    FUZZ_BACKEND = "rapidfuzz"
+except ImportError:  # pragma: no cover - exercised only when rapidfuzz absent
+    from difflib import SequenceMatcher
+
+    def _string_ratio(a: str, b: str) -> float:
+        return SequenceMatcher(None, a, b).ratio()
+
+    FUZZ_BACKEND = "difflib"
 
 _NULL_TOKEN = "\x00__dt_null__\x00"
 _FIELD_SEP = "\x1f"  # ASCII unit separator
@@ -159,7 +179,7 @@ def _cell_similarity(a, b, kind: str, scale: float, cfg: SimConfig) -> float:
     if sa == sb:
         return 1.0
     if cfg.string_soft:
-        return float(SequenceMatcher(None, sa, sb).ratio())
+        return float(_string_ratio(sa, sb))
     return 0.0
 
 
@@ -187,6 +207,81 @@ def row_similarity(
             new_row.get(c), parent_row.get(c), kinds[c], scales.get(c, 1.0), cfg
         )
     return total / len(columns)
+
+
+# --------------------------------------------------------------------------- #
+# Vectorised block similarity (rapidfuzz fast path)                           #
+# --------------------------------------------------------------------------- #
+# The scalar ``row_similarity`` above is O(rows x rows x columns) of pure-Python
+# work in the residual pass -- fine for small blocks, but the bottleneck on wide,
+# churny tables. When rapidfuzz is available we instead build the whole
+# new x parent similarity matrix per block with NumPy broadcasting (numeric) and
+# ``rapidfuzz.process.cdist`` (strings, in C), then assign greedily. Both paths
+# obey error confinement, so they need only agree up to a few tie-breaks.
+def _numeric_sim_matrix(a: np.ndarray, b: np.ndarray, scale: float, tol: float) -> np.ndarray:
+    """``(len(a), len(b))`` similarity for one numeric column (NaN-aware)."""
+    scale = scale if scale > 0 else 1.0
+    aa = a[:, None]
+    bb = b[None, :]
+    diff = np.abs(aa - bb)
+    m = np.clip(1.0 - diff / scale, 0.0, 1.0)
+    m = np.where(diff <= tol * scale, 1.0, m)
+    a_nan = np.isnan(aa)
+    b_nan = np.isnan(bb)
+    m = np.where(a_nan ^ b_nan, 0.0, m)       # exactly one missing -> mismatch
+    m = np.where(a_nan & b_nan, 1.0, m)       # both missing -> match
+    return np.nan_to_num(m, nan=0.0)
+
+
+def _string_sim_matrix(sa: List[str], sb: List[str],
+                       sa_nan: np.ndarray, sb_nan: np.ndarray, soft: bool) -> np.ndarray:
+    """``(len(sa), len(sb))`` similarity for one categorical/string column.
+
+    ``sa``/``sb`` already have NaNs replaced by ``_NULL_TOKEN``; the masks restore
+    the same-missing / one-missing semantics as :func:`_cell_similarity`.
+    """
+    if soft:
+        m = np.asarray(
+            _rf_process.cdist(sa, sb, scorer=_Indel.normalized_similarity, dtype=np.float32),
+            dtype=float,
+        )
+    else:
+        m = (np.asarray(sa, dtype=object)[:, None] == np.asarray(sb, dtype=object)[None, :]).astype(float)
+    m = np.where(sa_nan[:, None] ^ sb_nan[None, :], 0.0, m)
+    m = np.where(sa_nan[:, None] & sb_nan[None, :], 1.0, m)
+    return m
+
+
+def _greedy_pairs(sim_mat: np.ndarray, threshold: float) -> List[Tuple[int, int, float]]:
+    """Greedy global-best one-to-one assignment over a similarity matrix."""
+    if sim_mat.size == 0:
+        return []
+    n_new, n_par = sim_mat.shape
+    flat = sim_mat.ravel()
+    order = np.argsort(flat, kind="stable")[::-1]
+    used_n = np.zeros(n_new, dtype=bool)
+    used_p = np.zeros(n_par, dtype=bool)
+    pairs: List[Tuple[int, int, float]] = []
+    for idx in order:
+        score = float(flat[idx])
+        if score < threshold:
+            break
+        i, j = divmod(int(idx), n_par)
+        if used_n[i] or used_p[j]:
+            continue
+        used_n[i] = used_p[j] = True
+        pairs.append((i, j, score))
+        if len(pairs) == min(n_new, n_par):
+            break
+    return pairs
+
+
+def _string_column(s: pd.Series) -> Tuple[List[str], np.ndarray]:
+    """Column as a list of strings (NaN -> ``_NULL_TOKEN``) plus its NaN mask."""
+    nan_mask = s.isna().to_numpy()
+    vals = s.to_numpy(dtype=object)
+    out = [(_NULL_TOKEN if m else str(v)) for v, m in zip(vals, nan_mask)]
+    return out, nan_mask
 
 
 # --------------------------------------------------------------------------- #
@@ -308,32 +403,79 @@ def match_versions(
     for pi in residual_parent:
         parent_by_block.setdefault(parent_block_keys[pi], []).append(pi)
 
-    new_records = new_df.to_dict("records")
-    parent_records = parent_df.to_dict("records")
+    if FUZZ_BACKEND == "rapidfuzz":
+        # ---- vectorised fast path -------------------------------------------- #
+        # Build the whole new x parent similarity matrix per block: NumPy
+        # broadcasting for numeric columns, rapidfuzz.process.cdist (C) for
+        # strings, then a greedy global-best one-to-one assignment. This replaces
+        # the O(rows x rows x cols) pure-Python loop below.
+        cat_cols = [c for c in compare_cols if kinds[c] != "numeric"]
+        n_cols = len(compare_cols) or 1
+        num_new = {c: pd.to_numeric(new_df[c], errors="coerce").to_numpy(dtype=float)
+                   for c in numeric_cols}
+        num_par = {c: pd.to_numeric(parent_df[c], errors="coerce").to_numpy(dtype=float)
+                   for c in numeric_cols}
+        str_new = {c: _string_column(new_df[c]) for c in cat_cols}
+        str_par = {c: _string_column(parent_df[c]) for c in cat_cols}
 
-    claimed_parent: set = set()
-    for ni in residual_new:
-        candidates = parent_by_block.get(new_block_keys[ni], [])
-        if not candidates:
-            continue
-        if len(candidates) > max_block_pairs:
-            candidates = candidates[:max_block_pairs]
-        best_pi = -1
-        best_score = sim.row_threshold
-        nrow = new_records[ni]
-        for pi in candidates:
-            if pi in claimed_parent:
+        new_by_block: Dict[Tuple[str, ...], List[int]] = {}
+        for ni in residual_new:
+            new_by_block.setdefault(new_block_keys[ni], []).append(ni)
+
+        for bkey, n_idx in new_by_block.items():
+            p_idx = parent_by_block.get(bkey)
+            if not p_idx:
                 continue
-            score = row_similarity(nrow, parent_records[pi], compare_cols, kinds, scales, sim)
-            if score >= best_score:
-                best_score = score
-                best_pi = pi
-        if best_pi >= 0:
-            claimed_parent.add(best_pi)
-            result.pairs[ni] = parent_rids[best_pi]
-            result.confidence[ni] = float(best_score)
-            result.method[ni] = "fuzzy"
-            parent_matched[best_pi] = True
+            if len(n_idx) * len(p_idx) > max_block_pairs:
+                p_idx = p_idx[:max(1, max_block_pairs // len(n_idx))]
+            ni_arr = np.asarray(n_idx)
+            pi_arr = np.asarray(p_idx)
+            sim_sum = np.zeros((len(n_idx), len(p_idx)), dtype=float)
+            for c in numeric_cols:
+                sim_sum += _numeric_sim_matrix(
+                    num_new[c][ni_arr], num_par[c][pi_arr],
+                    scales.get(c, 1.0), sim.num_rel_tol,
+                )
+            for c in cat_cols:
+                sa, sa_nan = str_new[c]
+                sb, sb_nan = str_par[c]
+                sim_sum += _string_sim_matrix(
+                    [sa[i] for i in n_idx], [sb[i] for i in p_idx],
+                    sa_nan[ni_arr], sb_nan[pi_arr], sim.string_soft,
+                )
+            for i, j, score in _greedy_pairs(sim_sum / n_cols, sim.row_threshold):
+                ni, pi = n_idx[i], p_idx[j]
+                result.pairs[ni] = parent_rids[pi]
+                result.confidence[ni] = score
+                result.method[ni] = "fuzzy"
+                parent_matched[pi] = True
+    else:
+        # ---- scalar fallback (difflib): per-row best match within block ------ #
+        new_records = new_df.to_dict("records")
+        parent_records = parent_df.to_dict("records")
+        claimed_parent: set = set()
+        for ni in residual_new:
+            candidates = parent_by_block.get(new_block_keys[ni], [])
+            if not candidates:
+                continue
+            if len(candidates) > max_block_pairs:
+                candidates = candidates[:max_block_pairs]
+            best_pi = -1
+            best_score = sim.row_threshold
+            nrow = new_records[ni]
+            for pi in candidates:
+                if pi in claimed_parent:
+                    continue
+                score = row_similarity(nrow, parent_records[pi], compare_cols, kinds, scales, sim)
+                if score >= best_score:
+                    best_score = score
+                    best_pi = pi
+            if best_pi >= 0:
+                claimed_parent.add(best_pi)
+                result.pairs[ni] = parent_rids[best_pi]
+                result.confidence[ni] = float(best_score)
+                result.method[ni] = "fuzzy"
+                parent_matched[best_pi] = True
 
     result.inserts = [ni for ni in residual_new if ni not in result.pairs]
     result.deletes = [parent_rids[pi] for pi in range(n_parent) if not parent_matched[pi]]

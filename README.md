@@ -58,7 +58,9 @@ never correctness (see [error confinement](#correctness)).
 ```bash
 git clone https://github.com/Viswas-Reddy-PallamReddy/DeltaTrace.git
 cd DeltaTrace
-pip install -e .          # or: pip install -e ".[dev]" to run the tests
+pip install -e .            # core (pandas + pyarrow + numpy)
+pip install -e ".[fast]"   # + rapidfuzz: accelerates keyless matching (recommended)
+pip install -e ".[dev]"    # + pytest to run the tests
 ```
 
 ## Quickstart (Python)
@@ -155,9 +157,11 @@ version arrives with a consistent internal row-id column, so it never has to kno
 - **`ContentMatchIdentity` (keyless).** With no key to lean on, identity is
   *recovered* by matching each version against the previous one: a multiplicity-
   aware exact-hash join first, then a tolerance-aware fuzzy pass over the leftovers
-  (numeric tolerance, string similarity, blocking for speed). Matched rows inherit
-  their parent's id; genuinely new rows get a fresh one. `exact_only=True` drops
-  the fuzzy pass to emulate a plain content-hashing system.
+  (numeric tolerance, string similarity, blocking for speed). The string-similarity
+  step uses **rapidfuzz** when installed (a small C-extension) and transparently
+  falls back to the stdlib `difflib` otherwise, so the core stays dependency-light.
+  Matched rows inherit their parent's id; genuinely new rows get a fresh one.
+  `exact_only=True` drops the fuzzy pass to emulate a plain content-hashing system.
 
 Whatever a strategy guesses, **reconstruction stays exact** — see Correctness.
 
@@ -265,6 +269,12 @@ tables the parquet per-file floor dominates and plain snapshots are smaller.
   matching, so on tables with many identical rows it can attribute an edit to the
   "wrong" duplicate. By error confinement this only affects storage/provenance,
   never reconstruction — but if you *have* a reliable key, prefer it.
+- **Matching is a write-time cost; reads are not.** Identity recovery runs only at
+  `commit`. On wide, string-heavy tables the fuzzy residual pass dominates commit
+  latency; it is accelerated with rapidfuzz plus vectorised per-block similarity
+  matrices (≈2–3× faster than the pure-Python/`difflib` path on the benchmark's
+  largest tables). `checkout`/time-travel replay is identity-agnostic and stays
+  flat regardless of which identity strategy was used.
 - **Single-writer.** No concurrency control; intended for batch/offline use.
 
 ## Provenance
