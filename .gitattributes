@@ -1,0 +1,4 @@
+# Demo, example, and benchmark notebooks are supporting material rather than
+# the library itself. Mark them as documentation so GitHub's language
+# statistics reflect the Python package (deltatrace/) instead of the notebooks.
+*.ipynb linguist-documentation
