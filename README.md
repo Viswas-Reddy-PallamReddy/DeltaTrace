@@ -14,6 +14,21 @@ table: **commit → log → diff → checkout (time-travel)**, backed by Parquet
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)
 
+## Contents
+
+- [Why](#why)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Install](#install)
+- [Quickstart (Python)](#quickstart-python)
+- [Quickstart (CLI)](#quickstart-cli)
+- [How it works](#how-it-works)
+- [Project layout](#project-layout)
+- [Benchmarks](#benchmarks)
+- [Design notes &amp; limitations](#design-notes--limitations-honest)
+- [Provenance](#provenance)
+- [License](#license)
+
 ---
 
 ## Why
@@ -52,6 +67,30 @@ never correctness (see [error confinement](#correctness)).
 - **Cell-level update deltas** — an edited row stores only the columns that
   actually changed, not the whole row.
 - **CLI + Python API**, Parquet storage, only `pandas` + `pyarrow` required.
+
+## Architecture
+
+DeltaTrace cleanly separates *what changed* (the delta engine) from *how "the same
+row" is decided* (a pluggable **identity strategy**). A commit assigns stable row-ids
+via the active strategy, diffs the frame against the current head, and persists only
+the components that changed; `checkout` replays those components — short-circuited by a
+snapshot when one exists.
+
+```mermaid
+flowchart TD
+    A["New DataFrame"] --> B{"Identity strategy"}
+    B -->|PrimaryKeyIdentity| C["row-ids from primary key"]
+    B -->|ContentMatchIdentity| D["exact-hash, then fuzzy block match -> row-ids"]
+    C --> E["diff vs current head"]
+    D --> E
+    E --> F["row delta: added / deleted / updated cells"]
+    E --> G["column delta: added / dropped"]
+    E --> H["dtype changes"]
+    F --> S[("Store: Parquet + JSON deltas")]
+    G --> S
+    H --> S
+    S -. "checkout(v): read snapshot, else replay parent chain" .-> R["exact version v"]
+```
 
 ## Install
 
@@ -226,6 +265,25 @@ never corrupt data.
 ```bash
 pip install -e ".[dev]"
 pytest -q          # 43 passed
+```
+
+## Project layout
+
+```
+DeltaTrace/
+├── deltatrace/
+│   ├── repo.py        DeltaRepo: commit / checkout / diff / log / snapshot
+│   ├── identity.py    PrimaryKeyIdentity + ContentMatchIdentity (pluggable row id)
+│   ├── matching.py    keyless engine: canonicalisation, row hashing, fuzzy block match
+│   ├── diffing.py     row / column / type / cell-level diffs over row-ids
+│   ├── storage.py     on-disk Store: Parquet + JSON, repo scaffold, history log
+│   └── cli.py         `deltatrace` command-line entry point
+├── tests/             43 pytest cases (round-trip, snapshot, keyless, diff, CLI)
+├── benchmarks/        synthetic histories over famous keyless datasets + scoring
+├── examples/demo.py   runnable end-to-end demo
+├── notebooks/         prototype + keyless demo + full benchmark notebooks
+├── pyproject.toml     packaging; installs the `deltatrace` CLI
+└── README.md
 ```
 
 ## Benchmarks
